@@ -1,18 +1,39 @@
 import argparse
 import json
+import os
 from collections import defaultdict
 
 import numpy as np
 from openai import OpenAI
+from dotenv import load_dotenv
 
 from mem0.memory.utils import extract_json
 
-client = OpenAI()
+# 1) 加载 .env 里的配置
+load_dotenv()
+
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
+DASHSCOPE_BASE_URL = os.getenv(
+    "DASHSCOPE_BASE_URL",
+    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+)
+QWEN_JUDGE_MODEL = os.getenv("QWEN_JUDGE_MODEL", "qwen-plus")
+
+if not DASHSCOPE_API_KEY:
+    raise RuntimeError("DASHSCOPE_API_KEY is not set. Please set it in .env or env vars.")
+
+# 2) 用 OpenAI 客户端连阿里云的 OpenAI 兼容接口
+#    官方文档明确支持 base_url+api_key 这种写法
+#    https://www.alibabacloud.com/help/en/model-studio/qwen-api-reference
+client = OpenAI(
+    api_key=DASHSCOPE_API_KEY,
+    base_url=DASHSCOPE_BASE_URL,
+)
 
 ACCURACY_PROMPT = """
 Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You will be given the following data:
-    (1) a question (posed by one user to another user), 
-    (2) a ’gold’ (ground truth) answer, 
+    (1) a question (posed by one user to another user),
+    (2) a ’gold’ (ground truth) answer,
     (3) a generated answer
 which you will score as CORRECT/WRONG.
 
@@ -20,7 +41,7 @@ The point of the question is to ask about something one user should know about t
 The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
 Question: Do you remember what I got the last time I went to Hawaii?
 Gold answer: A shell necklace
-The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT. 
+The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT.
 
 For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
 
@@ -29,7 +50,7 @@ Question: {question}
 Gold answer: {gold_answer}
 Generated answer: {generated_answer}
 
-First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG. 
+First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
 Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
 
 Just return the label CORRECT or WRONG in a json format with the key as "label".
@@ -37,27 +58,35 @@ Just return the label CORRECT or WRONG in a json format with the key as "label".
 
 
 def evaluate_llm_judge(question, gold_answer, generated_answer):
-    """Evaluate the generated answer against the gold answer using an LLM judge."""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
+    """Evaluate the generated answer against the gold answer using a Qwen judge model."""
+    resp = client.chat.completions.create(
+        model=QWEN_JUDGE_MODEL,
         messages=[
             {
                 "role": "user",
                 "content": ACCURACY_PROMPT.format(
-                    question=question, gold_answer=gold_answer, generated_answer=generated_answer
+                    question=question,
+                    gold_answer=gold_answer,
+                    generated_answer=generated_answer,
                 ),
             }
         ],
+        # DashScope 的 OpenAI 兼容接口支持 /chat/completions + JSON 输出
+        # 这里保持和原来一样，返回一个 JSON object
         response_format={"type": "json_object"},
         temperature=0.0,
     )
-    label = json.loads(extract_json(response.choices[0].message.content))["label"]
+
+    content = resp.choices[0].message.content
+    # content 在 JSON mode 下通常就是一段 JSON 字符串
+    # 但为了安全，继续用 extract_json 做清洗
+    label = json.loads(extract_json(content))["label"].strip().upper()
     return 1 if label == "CORRECT" else 0
 
 
 def main():
     """Main function to evaluate RAG results using LLM judge."""
-    parser = argparse.ArgumentParser(description="Evaluate RAG results using LLM judge")
+    parser = argparse.ArgumentParser(description="Evaluate RAG results using LLM judge (Qwen on DashScope)")
     parser.add_argument(
         "--input_file",
         type=str,
@@ -68,9 +97,9 @@ def main():
     args = parser.parse_args()
 
     dataset_path = args.input_file
-    output_path = f"results/llm_judge_{dataset_path.split('/')[-1]}"
+    output_path = f"results/llm_judge_{os.path.basename(dataset_path)}"
 
-    with open(dataset_path, "r") as f:
+    with open(dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     LLM_JUDGE = defaultdict(list)
@@ -104,27 +133,28 @@ def main():
             )
 
             # Save intermediate results
-            with open(output_path, "w") as f:
-                json.dump(RESULTS, f, indent=4)
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(RESULTS, f, indent=4, ensure_ascii=False)
 
             # Print current accuracy for all categories
             print("All categories accuracy:")
             for cat, results in LLM_JUDGE.items():
-                if results:  # Only print if there are results for this category
+                if results:
                     print(f"  Category {cat}: {np.mean(results):.4f} ({sum(results)}/{len(results)})")
             print("------------------------------------------")
         index += 1
 
     # Save final results
-    with open(output_path, "w") as f:
-        json.dump(RESULTS, f, indent=4)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(RESULTS, f, indent=4, ensure_ascii=False)
 
     # Print final summary
     print("PATH: ", dataset_path)
     print("------------------------------------------")
-    for k, v in LLM_JUDGE.items():
-        print(k, np.mean(v))
+    for cat, results in LLM_JUDGE.items():
+        print(cat, np.mean(results))
 
 
 if __name__ == "__main__":
     main()
+
